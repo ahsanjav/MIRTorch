@@ -151,6 +151,7 @@ class NuSense(LinearMap):
     def __init__(self,
                  smaps: Tensor,
                  traj: Tensor,
+                 dcf: Tensor,
                  norm='ortho',
                  batchmode=True,
                  numpoints: Union[int, Sequence[int]] = 6,
@@ -162,6 +163,7 @@ class NuSense(LinearMap):
         self.batchmode = batchmode
         self.sequential = sequential
         assert grid_size >= 1, "grid size should be greater than 1"
+        self.dcf  = dcf
         if batchmode:
             self.grid_size = tuple(np.floor(np.array(smaps.shape[2:]) * grid_size).astype(int))
             self.A = tkbn.KbNufft(im_size=tuple(smaps.shape[2:]), grid_size=self.grid_size,
@@ -196,19 +198,21 @@ class NuSense(LinearMap):
                 for i in range(self.smaps.shape[1]):
                     k[:, i, ...] = self.A(x, self.traj, smaps=self.smaps[:, i, ...].unsqueeze(1),
                                           norm=self.norm).squeeze(1)
+                    k = k*self.dcf
                 return k
             else:
                 for i in range(self.smaps.shape[0]):
                     k[i, ...] = self.A(x.unsqueeze(0).unsqueeze(0), self.traj,
                                        smaps=self.smaps[i, ...].unsqueeze(0).unsqueeze(0), norm=self.norm).squeeze(
                         0).squeeze(0)
+                    k = k*self.dcf
                 return k
         else:
             if self.batchmode:
-                return self.A(x, self.traj, smaps=self.smaps, norm=self.norm)
+                return (self.A(x, self.traj, smaps=self.smaps, norm=self.norm)*self.dcf)
             else:
-                return self.A(x.unsqueeze(0).unsqueeze(0), self.traj, smaps=self.smaps.unsqueeze(0),
-                              norm=self.norm).squeeze(0).squeeze(0)
+                return (self.A(x.unsqueeze(0).unsqueeze(0), self.traj, smaps=self.smaps.unsqueeze(0),
+                              norm=self.norm).squeeze(0).squeeze(0)*self.dcf)
 
     def _apply_adjoint(self, y: Tensor) -> Tensor:
         r"""
@@ -221,20 +225,20 @@ class NuSense(LinearMap):
             x = torch.zeros(self.size_in).to(self.smaps)
             if self.batchmode:
                 for i in range(self.smaps.shape[1]):
-                    x += self.AT(y[:, i, ...].unsqueeze(1), self.traj, smaps=self.smaps[:, i, ...].unsqueeze(1),
+                    x += self.AT(y[:, i, ...].unsqueeze(1)*self.dcf, self.traj, smaps=self.smaps[:, i, ...].unsqueeze(1),
                                  norm=self.norm)
                 return x
             else:
                 for i in range(self.smaps.shape[0]):
-                    x += self.AT(y[i, ...].unsqueeze(0).unsqueeze(0), self.traj,
+                    x += self.AT(y[i, ...].unsqueeze(0).unsqueeze(0)*self.dcf, self.traj,
                                  smaps=self.smaps[i, ...].unsqueeze(0).unsqueeze(0), norm=self.norm).squeeze(0).squeeze(
                         0)
                 return x
         else:
             if self.batchmode:
-                return self.AT(y, self.traj, smaps=self.smaps, norm=self.norm)
+                return self.AT(y*self.dcf, self.traj, smaps=self.smaps, norm=self.norm)
             else:
-                return self.AT(y.unsqueeze(0), self.traj, smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
+                return self.AT(y.unsqueeze(0)*self.dcf, self.traj, smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
                     0).squeeze(0)
 
 
@@ -260,6 +264,7 @@ class NuSenseGram(LinearMap):
     def __init__(self,
                  smaps: Tensor,
                  traj: Tensor,
+                 dcf: Tensor,
                  norm='ortho',
                  batchmode=True,
                  numpoints: Union[int, Sequence[int]] = 6,
@@ -273,13 +278,13 @@ class NuSenseGram(LinearMap):
         if batchmode:
             self.grid_size = tuple(np.floor(np.array(smaps.shape[2:]) * grid_size).astype(int))
             self.kernel = tkbn.calc_toeplitz_kernel(traj, list(smaps.shape[2:]),
-                                                    grid_size=self.grid_size, numpoints=numpoints, norm=self.norm)
+                                                    grid_size=self.grid_size, numpoints=numpoints, norm=self.norm,  weights=dcf)
             size_in = [smaps.shape[0]] + [1] + list(smaps.shape[2:])
             super(NuSenseGram, self).__init__(tuple(size_in), tuple(size_in))
         else:
             self.grid_size = tuple(np.floor(np.array(smaps.shape[1:]) * grid_size).astype(int))
             self.kernel = tkbn.calc_toeplitz_kernel(traj, list(smaps.shape[1:]), grid_size=self.grid_size,
-                                                    numpoints=numpoints, norm=self.norm)
+                                                    numpoints=numpoints, norm=self.norm, weights=dcf)
             size_in = list(smaps.shape[1:])
             super(NuSenseGram, self).__init__(tuple(size_in), tuple(size_in))
 
