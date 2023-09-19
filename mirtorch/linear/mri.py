@@ -241,6 +241,138 @@ class NuSense(LinearMap):
                 return self.AT(y.unsqueeze(0)*self.dcf, self.traj, smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
                     0).squeeze(0)
 
+class NuSense_nd(LinearMap):
+    r"""
+    Non-Cartesian sense operator: "SENSE: Sensitivity encoding for fast MRI"
+    The implementation calls Matthew Muckley's Torchkbnufft toolbox:
+    https://github.com/mmuckley/torchkbnufft
+    The input/ourput size depends on the sensitivity maps.
+    If we use the batch dimension, the input dimension is [nbatch, 1, nx, ny, (nz)], and the output is [nbatch, ncoil, npoints].
+    Otherwise, the input dimension is [nx, ny, (nz)], and the output is [ncoil, npoints].
+
+
+    Attributes:
+        traj: tensor with dimension [(batch), ndim, nshot*npoints]. Note that traj can have no batch dimension even x have. ref: https://github.com/mmuckley/torchkbnufft/pull/24
+        sensitivity maps: tensor with dimension [(batch), ncoil, nx, ny, (nz)]. On the same device as traj.
+        sequential: bool, memory saving mode
+        batchmode: bool, determining if there exist batch and channel dimension (should always be 1).
+        norm: normalization of the fft ('ortho' or None)
+        numpoints: int, number of interpolation points in gridding.
+        grid_size: float, oversampling ratio (>1)
+    """
+
+    def __init__(self,
+                 smaps: Tensor,
+                 traj: list,
+                 dcf: list,
+                 spt: list,
+                 norm='ortho',
+                 batchmode=True,
+                 numpoints: Union[int, Sequence[int]] = 6,
+                 grid_size: float = 2,
+                 sequential: bool = False):
+        self.smaps = smaps
+        self.norm = norm
+        self.traj = traj
+        self.batchmode = batchmode
+        self.sequential = sequential
+        assert grid_size >= 1, "grid size should be greater than 1"
+        self.dcf  = dcf
+
+        self.spt = spt
+        self.RO  = int(traj[0].shape[-1]/spt[0])
+        if batchmode:
+            self.grid_size = tuple(np.floor(np.array(smaps.shape[2:]) * grid_size).astype(int))
+            self.A = tkbn.KbNufft(im_size=tuple(smaps.shape[2:]), grid_size=self.grid_size,
+                                  numpoints=numpoints).to(smaps)
+            self.AT = tkbn.KbNufftAdjoint(im_size=tuple(smaps.shape[2:]),
+                                          grid_size=self.grid_size,
+                                          numpoints=numpoints).to(smaps)
+            
+            #size_in = [smaps.shape[0]] + [1] + list(smaps.shape[2:])
+            size_out = list(smaps.shape[0:2]) + [np.sum(spt)*self.RO]
+            size_in = [len(traj)] + [1] + list(smaps.shape[2:])
+            # size_out = list()
+            # for t in traj:
+            #     size_out.append(list(smaps.shape[0:2]) + [t.shape[-1]])
+                
+            super(NuSense_nd, self).__init__(tuple(size_in), tuple(size_out))
+        else:
+            self.grid_size = tuple(np.floor(np.array(smaps.shape[1:]) * grid_size).astype(int))
+            self.A = tkbn.KbNufft(im_size=tuple(smaps.shape[1:]), grid_size=self.grid_size,
+                                  numpoints=numpoints).to(smaps)
+            self.AT = tkbn.KbNufftAdjoint(im_size=tuple(smaps.shape[1:]),
+                                          grid_size=self.grid_size,
+                                          numpoints=numpoints).to(smaps)
+            size_in = smaps.shape[1:]
+            size_out = [smaps.shape[0]] + [traj.shape[-1]]
+
+            super(NuSense_nd, self).__init__(tuple(size_in), tuple(size_out))
+
+    def _apply(self, x: Tensor) -> Tensor:
+        r"""
+        Args:
+            x:  tensor with dimension [nbatch, 1, nx, ny (nz)] (batchmode=True) or [nx, ny, (nz)]
+        Returns:
+            k： tensor with dimension [batch, ncoil, nshot*npoints] or [ncoil, nshot*npoints]
+        """
+        if self.sequential:
+            k = torch.zeros(self.size_out).to(self.smaps)
+            if self.batchmode:
+                for i in range(self.smaps.shape[1]):
+                    k[:, i, ...] = self.A(x, self.traj, smaps=self.smaps[:, i, ...].unsqueeze(1),
+                                          norm=self.norm).squeeze(1)
+                    k = k*self.dcf
+                return k
+            else:
+                for i in range(self.smaps.shape[0]):
+                    k[i, ...] = self.A(x.unsqueeze(0).unsqueeze(0), self.traj,
+                                       smaps=self.smaps[i, ...].unsqueeze(0).unsqueeze(0), norm=self.norm).squeeze(
+                        0).squeeze(0)
+                    k = k*self.dcf
+                return k
+        else:
+            output=torch.zeros(self.size_out,dtype=torch.cfloat).to(self.smaps)
+            
+            if self.batchmode:
+                for ind in range(0,len(self.traj)):
+                    output[:,:,self.RO*np.sum(self.spt[0:ind]):self.RO*np.sum(self.spt[0:ind+1])] = (self.A(x[ind,...].unsqueeze(0), self.traj[ind], smaps=self.smaps, norm=self.norm)*self.dcf[ind])
+            else:
+                for ind in range(0,len(self.traj)):
+                    output[:,:,self.RO*np.sum(self.spt[0:ind]):self.RO*np.sum(self.spt[0:ind+1])] = (self.A(x[ind,...].unsqueeze(0).unsqueeze(0), self.traj[ind], smaps=self.smaps.unsqueeze(0),
+                              norm=self.norm).squeeze(0).squeeze(0)*self.dcf[ind])
+            return output
+
+    def _apply_adjoint(self, y: Tensor) -> Tensor:
+        r"""
+        Args:
+            y： tensor with dimension [batch, ncoil, nshot*npoints] (batchmode=True)  or [ncoil, nshot*npoints]
+        Returns:
+            x:  tensor with dimension [nbatch, 1, nx, ny (nz)] (batchmode=True) or [nx, ny, (nz)]
+        """
+        if self.sequential:
+            x = torch.zeros(self.size_in).to(self.smaps)
+            if self.batchmode:
+                for i in range(self.smaps.shape[1]):
+                    x += self.AT(y[:, i, ...].unsqueeze(1)*self.dcf, self.traj, smaps=self.smaps[:, i, ...].unsqueeze(1),
+                                 norm=self.norm)
+                return x
+            else:
+                for i in range(self.smaps.shape[0]):
+                    x += self.AT(y[i, ...].unsqueeze(0).unsqueeze(0)*self.dcf, self.traj,
+                                 smaps=self.smaps[i, ...].unsqueeze(0).unsqueeze(0), norm=self.norm).squeeze(0).squeeze(
+                        0)
+                return x
+        else:
+            output = torch.zeros(self.size_in,dtype=torch.cfloat).to(self.smaps)
+            if self.batchmode:
+                for ind in range(0,len(self.traj)):
+                    output[ind,...] = self.AT(y[:,:,self.RO*np.sum(self.spt[0:ind]):self.RO*np.sum(self.spt[0:ind+1])]*self.dcf[ind], self.traj[ind], smaps=self.smaps, norm=self.norm)
+            else:
+                for ind in range(0,len(self.traj)):
+                    output[ind,...] = self.AT(y[:,:,self.RO*np.sum(self.spt[0:ind]):self.RO*np.sum(self.spt[0:ind+1])].unsqueeze(0)*self.dcf[ind], self.traj[ind], smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
+                    0).squeeze(0)
+            return output
 
 class NuSenseGram(LinearMap):
     r"""
@@ -307,6 +439,83 @@ class NuSenseGram(LinearMap):
         else:
             return self.toep_op(y.unsqueeze(0).unsqueeze(0), self.kernel, smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
                 0).squeeze(0)
+
+class NuSenseGram_nd(LinearMap):
+    r"""
+    Gram operator (A'A) of the Non-Cartesian sense operator: "SENSE: Sensitivity encoding for fast MRI"
+    The implementation calls Matthew Muckley's Torchkbnufft toolbox:
+    https://github.com/mmuckley/torchkbnufft
+    The input/ourput size depends on the sensitivity maps.
+    If we use the batch dimension, the input/output dimension is [nbatch, 1, nx, ny, (nz)].
+    Otherwise, the input/output dimension is [nx, ny, (nz)].
+
+
+    Attributes:
+        traj: tensor with dimension [(batch), ndim, nshot*npoints]. Note that traj can have no batch dimension even x have. ref: https://github.com/mmuckley/torchkbnufft/pull/24
+        sensitivity maps: tensor with dimension [(batch), ncoil, nx, ny, (nz)]. On the same device with traj.
+        norm: normalization of the fft ('ortho' or None)
+        numpoints: int, number of interpolation points in gridding.
+        grid_size: float, oversampling ratio (>1)
+        batchmode: bool, determining if there exist batch and channel dimension (should always be 1).
+    """
+
+    def __init__(self,
+                 smaps: Tensor,
+                 traj: list,
+                 dcf: list,
+                 norm='ortho',
+                 batchmode=True,
+                 numpoints: Union[int, Sequence[int]] = 6,
+                 grid_size: float = 2):
+        self.smaps = smaps
+        self.norm = norm
+        self.traj = traj
+        self.batchmode = batchmode
+        self.toep_op = tkbn.ToepNufft()
+        self.kernel = list()
+        if batchmode:
+            self.grid_size = tuple(np.floor(np.array(smaps.shape[2:]) * grid_size).astype(int))
+            for ind in range(0,len(traj)):
+                print(traj[ind].shape)
+                print(smaps.shape)
+                print(dcf[ind].shape)
+                self.kernel.append(tkbn.calc_toeplitz_kernel(traj[ind], list(smaps.shape[2:]),
+                                                    grid_size=self.grid_size, numpoints=numpoints, norm=self.norm,  weights=dcf[ind].unsqueeze(0)))
+            
+            size_in = [len(traj)] + [1] + list(smaps.shape[2:])
+            super(NuSenseGram_nd, self).__init__(tuple(size_in), tuple(size_in))
+        else:
+            self.grid_size = tuple(np.floor(np.array(smaps.shape[1:]) * grid_size).astype(int))
+            self.kernel = tkbn.calc_toeplitz_kernel(traj, list(smaps.shape[1:]), grid_size=self.grid_size,
+                                                    numpoints=numpoints, norm=self.norm, weights=dcf)
+            size_in = list(smaps.shape[1:])
+            super(NuSenseGram_nd, self).__init__(tuple(size_in), tuple(size_in))
+
+    def _apply(self, x: Tensor) -> Tensor:
+        r"""
+        Args:
+            x:  tensor with dimension [nbatch, 1, nx, ny (nz)] (batchmode=True) or [nx, ny, (nz)]
+        Returns:
+            x:  tensor with dimension [nbatch, 1, nx, ny (nz)] (batchmode=True) or [nx, ny, (nz)]
+        """
+        output = torch.zeros(self.size_in,dtype=torch.cfloat).to(self.smaps)
+        for ind in range(0,len(self.traj)):
+            if self.batchmode:
+                    output[ind,...] = self.toep_op(x[ind,...].unsqueeze(0), self.kernel[ind], smaps=self.smaps, norm=self.norm)
+                
+            else:
+                output[ind,...] = self.toep_op(x.unsqueeze(0).unsqueeze(0), self.kernel[ind], smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
+                    0).squeeze(0)
+        return output
+    def _apply_adjoint(self, y: Tensor) -> Tensor:
+        output = torch.zeros(self.size_in,dtype=torch.cfloat).to(self.smaps)
+        for ind in range(0,len(self.traj)):
+            if self.batchmode:
+                    output[ind,...] = self.toep_op(y[ind,...].unsqueeze(0), self.kernel[ind], smaps=self.smaps, norm=self.norm)
+            else:
+                return self.toep_op(y[ind,...].unsqueeze(0).unsqueeze(0), self.kernel[ind], smaps=self.smaps.unsqueeze(0), norm=self.norm).squeeze(
+                    0).squeeze(0)
+        return output
 
 
 class Gmri(LinearMap):
