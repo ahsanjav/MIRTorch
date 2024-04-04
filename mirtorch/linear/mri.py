@@ -476,9 +476,6 @@ class NuSenseGram_nd(LinearMap):
         if batchmode:
             self.grid_size = tuple(np.floor(np.array(smaps.shape[2:]) * grid_size).astype(int))
             for ind in range(0,len(traj)):
-                print(traj[ind].shape)
-                print(smaps.shape)
-                print(dcf[ind].shape)
                 self.kernel.append(tkbn.calc_toeplitz_kernel(traj[ind], list(smaps.shape[2:]),
                                                     grid_size=self.grid_size, numpoints=numpoints, norm=self.norm,  weights=dcf[ind].unsqueeze(0)))
             
